@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 import unittest
 
-from app.worker import WorkerConfig, run_worker
+from app.worker import WorkerConfig, parse_mssql_url, run_worker
 
 
 class FileHashWorkerTests(unittest.TestCase):
@@ -75,6 +75,68 @@ class FileHashWorkerTests(unittest.TestCase):
             self.assertEqual(stats.hashed, 1)
             row = self._fetch_row(db_path, 1)
             self.assertEqual(row["content_hash"], hashlib.sha256(b"mapped").hexdigest())
+
+    def test_csv_path_mapping_uses_real_file_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            real_file = root / "real" / "doc.txt"
+            real_file.parent.mkdir()
+            real_file.write_bytes(b"real content")
+            mapping_csv = root / "mapping.csv"
+            mapping_csv.write_text(
+                "wrong_path,real_path\n"
+                f"/wrong/doc.txt,{real_file}\n",
+                encoding="utf-8",
+            )
+            db_path = root / "files.sqlite"
+            self._create_database(db_path, [(1, "/wrong/doc.txt")])
+
+            stats = run_worker(
+                self._config(
+                    db_path,
+                    path_mapping_csv=str(mapping_csv),
+                    path_mapping_key_column="wrong_path",
+                    path_mapping_value_column="real_path",
+                    path_mapping_index=str(root / "mapping_index.sqlite"),
+                )
+            )
+
+            self.assertEqual(stats.hashed, 1)
+            row = self._fetch_row(db_path, 1)
+            self.assertEqual(row["content_hash"], hashlib.sha256(b"real content").hexdigest())
+
+    def test_missing_csv_mapping_is_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mapping_csv = root / "mapping.csv"
+            mapping_csv.write_text("wrong_path,real_path\n/other/path,/real/path\n", encoding="utf-8")
+            db_path = root / "files.sqlite"
+            self._create_database(db_path, [(1, "/wrong/doc.txt")])
+
+            stats = run_worker(
+                self._config(
+                    db_path,
+                    path_mapping_csv=str(mapping_csv),
+                    path_mapping_key_column="wrong_path",
+                    path_mapping_value_column="real_path",
+                    path_mapping_index=str(root / "mapping_index.sqlite"),
+                )
+            )
+
+            self.assertEqual(stats.failed, 1)
+            row = self._fetch_row(db_path, 1)
+            self.assertEqual(row["content_hash_status"], "failed")
+            self.assertIn("path mapping not found", row["content_hash_error"])
+
+    def test_parse_mssql_url(self) -> None:
+        parsed = parse_mssql_url("mssql+pymssql://user:pass@db-host:1433/mydb?timeout=10")
+
+        self.assertEqual(parsed["host"], "db-host")
+        self.assertEqual(parsed["port"], 1433)
+        self.assertEqual(parsed["user"], "user")
+        self.assertEqual(parsed["password"], "pass")
+        self.assertEqual(parsed["database"], "mydb")
+        self.assertEqual(parsed["timeout"], 10)
 
     def _config(self, db_path: Path, **overrides) -> WorkerConfig:
         values = {

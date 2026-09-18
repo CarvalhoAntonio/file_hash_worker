@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import csv
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -42,7 +43,12 @@ class WorkerConfig:
     path_prefix_from: str = ""
     path_prefix_to: str = ""
     where_sql: str = ""
-    claim_statuses: Sequence[str] = ("pending", "failed")
+    claim_statuses: Sequence[str] = ("pending",)
+    path_mapping_csv: str = ""
+    path_mapping_key_column: str = ""
+    path_mapping_value_column: str = ""
+    path_mapping_index: str = ""
+    path_mapping_encoding: str = "utf-8-sig"
 
 
 @dataclass(frozen=True)
@@ -60,6 +66,12 @@ class HashResult:
     error: Optional[str]
     size_bytes: Optional[int]
     updated_at: str
+
+
+@dataclass(frozen=True)
+class ResolvedFile:
+    row_id: object
+    path: str
 
 
 @dataclass
@@ -109,8 +121,10 @@ def run_worker(config: WorkerConfig) -> WorkerStats:
     ensure_hash_available(config.hash_algo)
 
     client = create_database_client(config)
+    path_mapper: Optional[PathMapper] = None
     stats = WorkerStats()
     try:
+        path_mapper = create_path_mapper(config)
         if config.ensure_columns:
             client.ensure_columns()
         if config.reset_processing_on_start:
@@ -127,7 +141,8 @@ def run_worker(config: WorkerConfig) -> WorkerStats:
                 break
 
             stats.claimed += len(batch)
-            results = hash_batch(batch, config)
+            resolved_batch, mapping_results = resolve_batch_paths(batch, config, path_mapper)
+            results = [*mapping_results, *hash_batch(resolved_batch, config)]
             client.update_results(results)
 
             for result in results:
@@ -147,10 +162,43 @@ def run_worker(config: WorkerConfig) -> WorkerStats:
             )
     finally:
         client.close()
+        if path_mapper is not None:
+            path_mapper.close()
     return stats
 
 
-def hash_batch(batch: Sequence[ClaimedFile], config: WorkerConfig) -> List[HashResult]:
+def resolve_batch_paths(
+    batch: Sequence[ClaimedFile],
+    config: WorkerConfig,
+    path_mapper: "PathMapper",
+) -> tuple[List[ResolvedFile], List[HashResult]]:
+    resolved: List[ResolvedFile] = []
+    failed: List[HashResult] = []
+    for row in batch:
+        mapped_path = path_mapper.resolve(row.path)
+        if mapped_path is None:
+            failed.append(
+                HashResult(
+                    row_id=row.row_id,
+                    content_hash=None,
+                    hash_algo=config.hash_algo,
+                    status="failed",
+                    error=f"path mapping not found for `{row.path}`",
+                    size_bytes=None,
+                    updated_at=utc_now(),
+                )
+            )
+            continue
+        resolved.append(
+            ResolvedFile(
+                row_id=row.row_id,
+                path=map_path(mapped_path, config.path_prefix_from, config.path_prefix_to),
+            )
+        )
+    return resolved, failed
+
+
+def hash_batch(batch: Sequence[ResolvedFile], config: WorkerConfig) -> List[HashResult]:
     max_workers = max(1, config.workers)
     if max_workers == 1:
         return [hash_one_file(row, config) for row in batch]
@@ -163,8 +211,8 @@ def hash_batch(batch: Sequence[ClaimedFile], config: WorkerConfig) -> List[HashR
     return results
 
 
-def hash_one_file(row: ClaimedFile, config: WorkerConfig) -> HashResult:
-    resolved_path = map_path(row.path, config.path_prefix_from, config.path_prefix_to)
+def hash_one_file(row: ResolvedFile, config: WorkerConfig) -> HashResult:
+    resolved_path = row.path
     now = utc_now()
     try:
         path = Path(resolved_path)
@@ -210,6 +258,132 @@ def map_path(path: str, prefix_from: str, prefix_to: str) -> str:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class PathMapper(Protocol):
+    def resolve(self, db_path: str) -> Optional[str]:
+        ...
+
+    def close(self) -> None:
+        ...
+
+
+class DirectPathMapper:
+    def resolve(self, db_path: str) -> Optional[str]:
+        return db_path
+
+    def close(self) -> None:
+        return None
+
+
+class CsvPathMapper:
+    def __init__(self, config: WorkerConfig) -> None:
+        self.config = config
+        self.csv_path = Path(config.path_mapping_csv).expanduser()
+        if not self.csv_path.is_file():
+            raise FileNotFoundError(f"PATH_MAPPING_CSV `{self.csv_path}` does not exist")
+        index_path = (
+            Path(config.path_mapping_index).expanduser()
+            if config.path_mapping_index
+            else self.csv_path.with_suffix(f"{self.csv_path.suffix}.sqlite")
+        )
+        self.connection = sqlite3.connect(str(index_path), timeout=60)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA synchronous=NORMAL")
+        self._ensure_index()
+
+    def resolve(self, db_path: str) -> Optional[str]:
+        row = self.connection.execute(
+            "SELECT real_path FROM path_mapping WHERE db_path = ?",
+            (db_path,),
+        ).fetchone()
+        return str(row[0]) if row is not None else None
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def _ensure_index(self) -> None:
+        self.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS path_mapping (
+                db_path TEXT PRIMARY KEY,
+                real_path TEXT NOT NULL
+            );
+            """
+        )
+        fingerprint = self._fingerprint()
+        existing = {
+            str(row[0]): str(row[1])
+            for row in self.connection.execute("SELECT key, value FROM meta").fetchall()
+        }
+        if existing == fingerprint:
+            return
+
+        LOGGER.info("building path mapping index csv=%s", self.csv_path)
+        self.connection.execute("DELETE FROM path_mapping")
+        inserted = 0
+        with self.csv_path.open("r", encoding=self.config.path_mapping_encoding, newline="") as csv_file:
+            reader = csv.DictReader(csv_file)
+            if reader.fieldnames is None:
+                raise ValueError("PATH_MAPPING_CSV has no header row")
+            missing_columns = {
+                column
+                for column in (self.config.path_mapping_key_column, self.config.path_mapping_value_column)
+                if column not in reader.fieldnames
+            }
+            if missing_columns:
+                raise ValueError(f"PATH_MAPPING_CSV missing columns: {', '.join(sorted(missing_columns))}")
+
+            rows: list[tuple[str, str]] = []
+            for csv_row in reader:
+                db_path = (csv_row.get(self.config.path_mapping_key_column) or "").strip()
+                real_path = (csv_row.get(self.config.path_mapping_value_column) or "").strip()
+                if not db_path or not real_path:
+                    continue
+                rows.append((db_path, real_path))
+                if len(rows) >= 10_000:
+                    self._insert_mapping_rows(rows)
+                    inserted += len(rows)
+                    rows.clear()
+            if rows:
+                self._insert_mapping_rows(rows)
+                inserted += len(rows)
+
+        self.connection.execute("DELETE FROM meta")
+        self.connection.executemany(
+            "INSERT INTO meta(key, value) VALUES(?, ?)",
+            sorted(fingerprint.items()),
+        )
+        self.connection.commit()
+        LOGGER.info("path mapping index ready rows=%s", inserted)
+
+    def _insert_mapping_rows(self, rows: Sequence[tuple[str, str]]) -> None:
+        self.connection.executemany(
+            "INSERT OR REPLACE INTO path_mapping(db_path, real_path) VALUES(?, ?)",
+            rows,
+        )
+        self.connection.commit()
+
+    def _fingerprint(self) -> dict[str, str]:
+        stat_result = self.csv_path.stat()
+        return {
+            "csv_path": str(self.csv_path.resolve()),
+            "csv_size": str(stat_result.st_size),
+            "csv_mtime_ns": str(stat_result.st_mtime_ns),
+            "key_column": self.config.path_mapping_key_column,
+            "value_column": self.config.path_mapping_value_column,
+            "encoding": self.config.path_mapping_encoding,
+        }
+
+
+def create_path_mapper(config: WorkerConfig) -> PathMapper:
+    if not config.path_mapping_csv:
+        return DirectPathMapper()
+    return CsvPathMapper(config)
 
 
 class SqliteClient:
@@ -519,12 +693,200 @@ class MysqlClient:
         return eligible_status_params(self.config.claim_statuses, self.claim_started_at)
 
 
+class MssqlClient:
+    def __init__(self, config: WorkerConfig) -> None:
+        try:
+            import pymssql
+        except ImportError as exc:
+            raise RuntimeError("Microsoft SQL Server support requires the `pymssql` package") from exc
+
+        self.config = config
+        self.pymssql = pymssql
+        self.table = quote_table(config.table_name, "[]")
+        self.id_column = quote_identifier(config.id_column, "[]")
+        self.path_column = quote_identifier(config.path_column, "[]")
+        self.hash_column = quote_identifier(config.hash_column, "[]")
+        self.algo_column = quote_identifier(config.algo_column, "[]")
+        self.status_column = quote_identifier(config.status_column, "[]")
+        self.error_column = quote_identifier(config.error_column, "[]")
+        self.size_column = quote_identifier(config.size_column, "[]")
+        self.updated_at_column = quote_identifier(config.updated_at_column, "[]")
+        self.claim_started_at = utc_now()
+        self.connection = self._connect()
+
+    def ensure_columns(self) -> None:
+        existing = self._existing_columns()
+        column_definitions = {
+            self.config.hash_column: "NVARCHAR(128)",
+            self.config.algo_column: "NVARCHAR(32)",
+            self.config.status_column: "NVARCHAR(32)",
+            self.config.error_column: "NVARCHAR(MAX)",
+            self.config.size_column: "BIGINT",
+            self.config.updated_at_column: "NVARCHAR(40)",
+        }
+        cursor = self.connection.cursor()
+        try:
+            for column, column_type in column_definitions.items():
+                if column not in existing:
+                    cursor.execute(
+                        f"ALTER TABLE {self.table} ADD {quote_identifier(column, '[]')} {column_type}"
+                    )
+        finally:
+            cursor.close()
+        self.connection.commit()
+
+    def reset_processing(self) -> int:
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(
+                f"""
+                UPDATE {self.table}
+                SET {self.status_column} = 'pending',
+                    {self.error_column} = NULL,
+                    {self.updated_at_column} = %s
+                WHERE {self.status_column} = 'processing'
+                """,
+                (utc_now(),),
+            )
+            rowcount = cursor.rowcount
+        finally:
+            cursor.close()
+        self.connection.commit()
+        return int(rowcount)
+
+    def claim_batch(self, limit: int) -> List[ClaimedFile]:
+        cursor = self.connection.cursor(as_dict=True)
+        try:
+            cursor.execute("BEGIN TRANSACTION")
+            cursor.execute(self._claim_select_sql(limit), self._eligible_status_params())
+            rows = cursor.fetchall()
+            claimed = [
+                ClaimedFile(row_id=row[self.config.id_column], path=str(row[self.config.path_column]))
+                for row in rows
+            ]
+            if claimed:
+                cursor.execute(
+                    f"""
+                    UPDATE {self.table}
+                    SET {self.status_column} = 'processing',
+                        {self.error_column} = NULL,
+                        {self.updated_at_column} = %s
+                    WHERE {self.id_column} IN ({placeholders(len(claimed), '%s')})
+                    """,
+                    (utc_now(), *[row.row_id for row in claimed]),
+                )
+            self.connection.commit()
+            return claimed
+        except Exception:
+            self.connection.rollback()
+            raise
+        finally:
+            cursor.close()
+
+    def update_results(self, results: Sequence[HashResult]) -> None:
+        if not results:
+            return
+        cursor = self.connection.cursor()
+        try:
+            cursor.executemany(
+                f"""
+                UPDATE {self.table}
+                SET {self.hash_column} = %s,
+                    {self.algo_column} = %s,
+                    {self.status_column} = %s,
+                    {self.error_column} = %s,
+                    {self.size_column} = %s,
+                    {self.updated_at_column} = %s
+                WHERE {self.id_column} = %s
+                """,
+                [
+                    (
+                        result.content_hash,
+                        result.hash_algo,
+                        result.status,
+                        result.error,
+                        result.size_bytes,
+                        result.updated_at,
+                        result.row_id,
+                    )
+                    for result in results
+                ],
+            )
+        finally:
+            cursor.close()
+        self.connection.commit()
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def _connect(self):
+        parsed = parse_mssql_url(self.config.db_url)
+        return self.pymssql.connect(
+            server=parsed["host"],
+            port=parsed["port"],
+            user=parsed["user"],
+            password=parsed["password"],
+            database=parsed["database"],
+            charset=parsed["charset"],
+            autocommit=False,
+            login_timeout=parsed["login_timeout"],
+            timeout=parsed["timeout"],
+        )
+
+    def _existing_columns(self) -> set[str]:
+        schema, table = mssql_schema_table_parts(self.config.table_name)
+        cursor = self.connection.cursor(as_dict=True)
+        try:
+            cursor.execute(
+                """
+                SELECT COLUMN_NAME
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                """,
+                (schema, table),
+            )
+            return {str(row["COLUMN_NAME"]) for row in cursor.fetchall()}
+        finally:
+            cursor.close()
+
+    def _claim_select_sql(self, limit: int) -> str:
+        safe_limit = max(1, int(limit))
+        return f"""
+            SELECT TOP ({safe_limit})
+                   {self.id_column} AS {quote_identifier(self.config.id_column, '[]')},
+                   {self.path_column} AS {quote_identifier(self.config.path_column, '[]')}
+            FROM {self.table} WITH (UPDLOCK, READPAST, ROWLOCK)
+            WHERE {self._eligible_where_sql('%s')}
+            ORDER BY {self.id_column}
+        """
+
+    def _eligible_where_sql(self, placeholder: str) -> str:
+        status_sql = eligible_status_sql(
+            status_column=self.status_column,
+            updated_at_column=self.updated_at_column,
+            placeholder=placeholder,
+            claim_statuses=self.config.claim_statuses,
+        )
+        where = (
+            f"({self.hash_column} IS NULL OR {self.hash_column} = '') "
+            f"AND ({status_sql})"
+        )
+        if self.config.where_sql:
+            where = f"({where}) AND ({self.config.where_sql})"
+        return where
+
+    def _eligible_status_params(self) -> tuple:
+        return eligible_status_params(self.config.claim_statuses, self.claim_started_at)
+
+
 def create_database_client(config: WorkerConfig) -> DatabaseClient:
     if config.db_type == "sqlite":
         return SqliteClient(config)
     if config.db_type == "mysql":
         return MysqlClient(config)
-    raise ValueError("DB_TYPE must be `sqlite` or `mysql`")
+    if config.db_type == "mssql":
+        return MssqlClient(config)
+    raise ValueError("DB_TYPE must be `sqlite`, `mysql`, or `mssql`")
 
 
 def parse_config(argv: Optional[Sequence[str]] = None) -> WorkerConfig:
@@ -552,6 +914,11 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> WorkerConfig:
     parser.add_argument("--path-prefix-to", default=os.getenv("PATH_PREFIX_TO", ""))
     parser.add_argument("--where-sql", default=os.getenv("WHERE_SQL", ""))
     parser.add_argument("--claim-statuses", default=os.getenv("CLAIM_STATUSES", "pending"))
+    parser.add_argument("--path-mapping-csv", default=os.getenv("PATH_MAPPING_CSV", ""))
+    parser.add_argument("--path-mapping-key-column", default=os.getenv("PATH_MAPPING_KEY_COLUMN", ""))
+    parser.add_argument("--path-mapping-value-column", default=os.getenv("PATH_MAPPING_VALUE_COLUMN", ""))
+    parser.add_argument("--path-mapping-index", default=os.getenv("PATH_MAPPING_INDEX", ""))
+    parser.add_argument("--path-mapping-encoding", default=os.getenv("PATH_MAPPING_ENCODING", "utf-8-sig"))
     args = parser.parse_args(argv)
 
     return WorkerConfig(
@@ -577,12 +944,17 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> WorkerConfig:
         path_prefix_to=args.path_prefix_to,
         where_sql=args.where_sql,
         claim_statuses=tuple(status.strip() for status in args.claim_statuses.split(",") if status.strip()),
+        path_mapping_csv=args.path_mapping_csv,
+        path_mapping_key_column=args.path_mapping_key_column,
+        path_mapping_value_column=args.path_mapping_value_column,
+        path_mapping_index=args.path_mapping_index,
+        path_mapping_encoding=args.path_mapping_encoding,
     )
 
 
 def validate_config(config: WorkerConfig) -> None:
-    if config.db_type not in {"sqlite", "mysql"}:
-        raise ValueError("DB_TYPE must be `sqlite` or `mysql`")
+    if config.db_type not in {"sqlite", "mysql", "mssql"}:
+        raise ValueError("DB_TYPE must be `sqlite`, `mysql`, or `mssql`")
     if not config.db_url:
         raise ValueError("DB_URL is required")
     validate_table_name(config.table_name)
@@ -607,6 +979,12 @@ def validate_config(config: WorkerConfig) -> None:
         raise ValueError("MAX_ROWS must be >= 0")
     if not config.claim_statuses:
         raise ValueError("CLAIM_STATUSES must contain at least one status")
+    if config.path_mapping_csv and not (config.path_mapping_key_column and config.path_mapping_value_column):
+        raise ValueError(
+            "PATH_MAPPING_KEY_COLUMN and PATH_MAPPING_VALUE_COLUMN are required when PATH_MAPPING_CSV is set"
+        )
+    if config.db_type == "mssql" and len(config.table_name.split(".")) > 2:
+        raise ValueError("MSSQL TABLE_NAME must be `table` or `schema.table`")
 
 
 def validate_table_name(table_name: str) -> None:
@@ -623,6 +1001,8 @@ def validate_identifier(identifier: str) -> None:
 
 def quote_identifier(identifier: str, quote: str) -> str:
     validate_identifier(identifier)
+    if quote == "[]":
+        return f"[{identifier}]"
     return f"{quote}{identifier}{quote}"
 
 
@@ -696,6 +1076,38 @@ def parse_mysql_url(db_url: str) -> dict:
         "database": database,
         "charset": query.get("charset", ["utf8mb4"])[0],
     }
+
+
+def parse_mssql_url(db_url: str) -> dict:
+    url = db_url.replace("mssql+pymssql://", "mssql://", 1)
+    parsed = urlparse(url)
+    if parsed.scheme != "mssql":
+        raise ValueError("MSSQL DB_URL must start with mssql:// or mssql+pymssql://")
+    if not parsed.hostname:
+        raise ValueError("MSSQL DB_URL is missing host")
+    database = parsed.path.lstrip("/")
+    if not database:
+        raise ValueError("MSSQL DB_URL is missing database name")
+    query = parse_qs(parsed.query)
+    return {
+        "host": parsed.hostname,
+        "port": parsed.port or 1433,
+        "user": unquote(parsed.username or ""),
+        "password": unquote(parsed.password or ""),
+        "database": database,
+        "charset": query.get("charset", ["UTF-8"])[0],
+        "login_timeout": int(query.get("login_timeout", ["30"])[0]),
+        "timeout": int(query.get("timeout", ["0"])[0]),
+    }
+
+
+def mssql_schema_table_parts(table_name: str) -> tuple[str, str]:
+    parts = table_name.split(".")
+    if len(parts) == 1:
+        return "dbo", parts[0]
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    raise ValueError("MSSQL TABLE_NAME must be `table` or `schema.table`")
 
 
 def env_int(name: str, default: int) -> int:
