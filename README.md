@@ -22,16 +22,16 @@ content_hash_updated_at
 
 ## Run
 
-Build:
-
-```bash
-docker build -t file_hash_worker:latest .
-```
-
 Load from airgap image tar:
 
 ```bash
 docker load -i file_hash_worker_image_dev_antonio.tar
+```
+
+Or build locally:
+
+```bash
+docker build -t file_hash_worker:latest .
 ```
 
 SQLite:
@@ -80,4 +80,14 @@ BATCH_SIZE=1000
 HASH_ALGO=blake3
 RESET_PROCESSING_ON_START=true
 WHERE_SQL='id >= 0 AND id < 1000000'
+MAX_ROWS=0
+CLAIM_STATUSES=pending
 ```
+
+- `WORKERS`: how many files to hash at the same time.
+- `BATCH_SIZE`: how many DB rows to claim/update per loop.
+- `HASH_ALGO`: `blake3` is fast; `sha256` is slower but more standard.
+- `RESET_PROCESSING_ON_START`: moves stuck `processing` rows back to `pending` after a crash.
+- `WHERE_SQL`: extra filter to split work, for example by ID range or path.
+- `MAX_ROWS`: stop after this many rows; `0` means no limit.
+- `CLAIM_STATUSES`: which row statuses are allowed to be picked up.
