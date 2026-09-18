@@ -82,13 +82,24 @@ If DB paths are host paths but the container sees files under `/data`:
 -e PATH_PREFIX_TO=/data
 ```
 
-If the DB path is wrong and you have a CSV mapping wrong path -> real path:
+If the DB path is wrong and you have a CSV mapping wrong full path -> real full path:
 
 ```bash
 -v /real/mapping:/mapping:ro \
 -e PATH_MAPPING_CSV=/mapping/paths.csv \
 -e PATH_MAPPING_KEY_COLUMN=wrong_path \
--e PATH_MAPPING_VALUE_COLUMN=real_path
+-e PATH_MAPPING_VALUE_COLUMN=real_path \
+-e PATH_MAPPING_MODE=full_path
+```
+
+If the DB path is `SHARE_NAME\\folder\\file.pdf` and the CSV maps share name -> real share root:
+
+```bash
+-v /real/mapping:/mapping:ro \
+-e PATH_MAPPING_CSV=/mapping/shares.csv \
+-e PATH_MAPPING_KEY_COLUMN=SHARE_NAME \
+-e PATH_MAPPING_VALUE_COLUMN=SHARE \
+-e PATH_MAPPING_MODE=share_prefix
 ```
 
 Default hash is `blake3`. Use `HASH_ALGO=sha256` if needed.
@@ -106,6 +117,7 @@ WHERE_SQL='id >= 0 AND id < 1000000'
 MAX_ROWS=0
 CLAIM_STATUSES=pending
 PATH_MAPPING_CSV=/mapping/paths.csv
+PATH_MAPPING_MODE=full_path
 ```
 
 - `WORKERS`: how many files to hash at the same time.
@@ -116,3 +128,4 @@ PATH_MAPPING_CSV=/mapping/paths.csv
 - `MAX_ROWS`: stop after this many rows; `0` means no limit.
 - `CLAIM_STATUSES`: which row statuses are allowed to be picked up.
 - `PATH_MAPPING_CSV`: optional CSV that maps the DB path to the real file path.
+- `PATH_MAPPING_MODE`: `full_path` replaces the whole path; `share_prefix` replaces the first backslash-separated share name.

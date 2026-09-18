@@ -128,6 +128,61 @@ class FileHashWorkerTests(unittest.TestCase):
             self.assertEqual(row["content_hash_status"], "failed")
             self.assertIn("path mapping not found", row["content_hash_error"])
 
+    def test_csv_share_prefix_mapping_replaces_backslash_share(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            share_root = root / "share_a"
+            real_file = share_root / "folder" / "doc.txt"
+            real_file.parent.mkdir(parents=True)
+            real_file.write_bytes(b"share content")
+            mapping_csv = root / "shares.csv"
+            mapping_csv.write_text(
+                "SHARE_NAME,SHARE\n"
+                f"ARCHIVE01,{share_root}\n",
+                encoding="utf-8",
+            )
+            db_path = root / "files.sqlite"
+            self._create_database(db_path, [(1, r"ARCHIVE01\\folder\\doc.txt")])
+
+            stats = run_worker(
+                self._config(
+                    db_path,
+                    path_mapping_csv=str(mapping_csv),
+                    path_mapping_key_column="SHARE_NAME",
+                    path_mapping_value_column="SHARE",
+                    path_mapping_index=str(root / "share_index.sqlite"),
+                    path_mapping_mode="share_prefix",
+                )
+            )
+
+            self.assertEqual(stats.hashed, 1)
+            row = self._fetch_row(db_path, 1)
+            self.assertEqual(row["content_hash"], hashlib.sha256(b"share content").hexdigest())
+
+    def test_csv_share_prefix_mapping_missing_share_is_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mapping_csv = root / "shares.csv"
+            mapping_csv.write_text("SHARE_NAME,SHARE\nOTHER,/real/share\n", encoding="utf-8")
+            db_path = root / "files.sqlite"
+            self._create_database(db_path, [(1, r"ARCHIVE01\\folder\\doc.txt")])
+
+            stats = run_worker(
+                self._config(
+                    db_path,
+                    path_mapping_csv=str(mapping_csv),
+                    path_mapping_key_column="SHARE_NAME",
+                    path_mapping_value_column="SHARE",
+                    path_mapping_index=str(root / "share_index.sqlite"),
+                    path_mapping_mode="share_prefix",
+                )
+            )
+
+            self.assertEqual(stats.failed, 1)
+            row = self._fetch_row(db_path, 1)
+            self.assertEqual(row["content_hash_status"], "failed")
+            self.assertIn("path mapping not found", row["content_hash_error"])
+
     def test_parse_mssql_url(self) -> None:
         parsed = parse_mssql_url("mssql+pymssql://user:pass@db-host:1433/mydb?timeout=10")
 

@@ -49,6 +49,7 @@ class WorkerConfig:
     path_mapping_value_column: str = ""
     path_mapping_index: str = ""
     path_mapping_encoding: str = "utf-8-sig"
+    path_mapping_mode: str = "full_path"
 
 
 @dataclass(frozen=True)
@@ -293,11 +294,33 @@ class CsvPathMapper:
         self._ensure_index()
 
     def resolve(self, db_path: str) -> Optional[str]:
+        if self.config.path_mapping_mode == "share_prefix":
+            return self._resolve_share_prefix(db_path)
+        return self._resolve_full_path(db_path)
+
+    def _resolve_full_path(self, db_path: str) -> Optional[str]:
         row = self.connection.execute(
             "SELECT real_path FROM path_mapping WHERE db_path = ?",
             (db_path,),
         ).fetchone()
         return str(row[0]) if row is not None else None
+
+    def _resolve_share_prefix(self, db_path: str) -> Optional[str]:
+        parts = [part for part in re.split(r"\\+", db_path.strip("\\/")) if part]
+        if not parts:
+            return None
+
+        row = self.connection.execute(
+            "SELECT real_path FROM path_mapping WHERE db_path = ?",
+            (parts[0],),
+        ).fetchone()
+        if row is None:
+            return None
+
+        share_root = str(row[0]).rstrip("\\/")
+        if len(parts) == 1:
+            return share_root
+        return str(Path(share_root).joinpath(*parts[1:]))
 
     def close(self) -> None:
         self.connection.close()
@@ -377,6 +400,7 @@ class CsvPathMapper:
             "key_column": self.config.path_mapping_key_column,
             "value_column": self.config.path_mapping_value_column,
             "encoding": self.config.path_mapping_encoding,
+            "mode": self.config.path_mapping_mode,
         }
 
 
@@ -919,6 +943,7 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> WorkerConfig:
     parser.add_argument("--path-mapping-value-column", default=os.getenv("PATH_MAPPING_VALUE_COLUMN", ""))
     parser.add_argument("--path-mapping-index", default=os.getenv("PATH_MAPPING_INDEX", ""))
     parser.add_argument("--path-mapping-encoding", default=os.getenv("PATH_MAPPING_ENCODING", "utf-8-sig"))
+    parser.add_argument("--path-mapping-mode", default=os.getenv("PATH_MAPPING_MODE", "full_path").casefold())
     args = parser.parse_args(argv)
 
     return WorkerConfig(
@@ -949,6 +974,7 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> WorkerConfig:
         path_mapping_value_column=args.path_mapping_value_column,
         path_mapping_index=args.path_mapping_index,
         path_mapping_encoding=args.path_mapping_encoding,
+        path_mapping_mode=args.path_mapping_mode,
     )
 
 
@@ -983,6 +1009,8 @@ def validate_config(config: WorkerConfig) -> None:
         raise ValueError(
             "PATH_MAPPING_KEY_COLUMN and PATH_MAPPING_VALUE_COLUMN are required when PATH_MAPPING_CSV is set"
         )
+    if config.path_mapping_mode not in {"full_path", "share_prefix"}:
+        raise ValueError("PATH_MAPPING_MODE must be `full_path` or `share_prefix`")
     if config.db_type == "mssql" and len(config.table_name.split(".")) > 2:
         raise ValueError("MSSQL TABLE_NAME must be `table` or `schema.table`")
 
